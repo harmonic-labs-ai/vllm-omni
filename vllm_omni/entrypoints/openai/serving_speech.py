@@ -56,6 +56,11 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
 )
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.metrics import definitions as _metric_defs
+from vllm_omni.metrics.modality import (
+    observe_audio_first_packet,
+    observe_audio_streaming_finalize,
+)
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
     estimate_fish_voice_clone_prompt_len_from_normalized,
@@ -2730,6 +2735,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         stream_start_s = request_start_s if request_start_s is not None else time.perf_counter()
         artifact_ready = False
 
+        # Audio SLI metrics. Mirrors the chat streaming path: audio_ttfp_s on the
+        # first packet, then per-chunk arrival/byte accumulation for
+        # audio_underrun_s + audio_continuity_ok_total at clean close. The
+        # finalize-time families (frames/duration/rtf/skipped) are emitted by the
+        # engine-side, entrypoint-agnostic observe_modality_at_finalize hook and
+        # are intentionally NOT re-emitted here. req_state is resolved lazily on
+        # the first audio packet (request_states is keyed by the internal id, so
+        # we match on external_request_id) and the local reference outlives the
+        # finalize pop, so it stays valid through the post-loop emit.
+        mod_metrics = getattr(self.engine_client, "mod_metrics", None)
+        req_state = None
+
         try:
             async for res in generator:
                 # Tally generated codec tokens for usage (reads per-stage metrics
@@ -2790,13 +2807,72 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if first_audio_chunk_s is None:
                         first_audio_chunk_s = time.perf_counter()
+                        # Resolve req_state lazily now that audio has started, and
+                        # emit audio_ttfp_s once, resolving (stage, replica) the
+                        # same way the chat streaming path does.
+                        if mod_metrics is not None:
+                            req_state = next(
+                                (
+                                    s
+                                    for s in self.engine_client.request_states.values()
+                                    if s.external_request_id == request_id
+                                ),
+                                None,
+                            )
+                        if req_state is not None and req_state.first_audio_ts is None:
+                            now_ts = time.time()
+                            req_state.first_audio_ts = now_ts
+                            emit_stage_id = res.stage_id
+                            stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
+                            replica_id = (
+                                stage_pools[emit_stage_id].get_bound_replica_id(req_state.request_id)
+                                if (
+                                    stage_pools is not None
+                                    and emit_stage_id is not None
+                                    and 0 <= emit_stage_id < len(stage_pools)
+                                )
+                                else None
+                            )
+                            req_state.audio_emit_stage_id = emit_stage_id
+                            req_state.audio_emit_replica_id = replica_id
+                            observe_audio_first_packet(
+                                mod_metrics,
+                                stage_id=emit_stage_id if emit_stage_id is not None else 0,
+                                replica_id=replica_id,
+                                arrival_ts=req_state.request_arrival_ts,
+                                now_ts=now_ts,
+                            )
                     audio_bytes = self.create_audio(audio_obj).audio_data
+                    # Per-chunk PCM byte + arrival accumulation for
+                    # audio_underrun_s / audio_continuity_ok_total at clean close.
+                    if req_state is not None and req_state.request_arrival_ts > 0 and audio_bytes:
+                        req_state.audio_chunk_arrivals_s.append(max(time.time() - req_state.request_arrival_ts, 0.0))
+                        req_state.audio_chunk_bytes.append(len(audio_bytes))
+                        if req_state.audio_sample_rate is None:
+                            req_state.audio_sample_rate = sample_rate_val
                     if include_sample_rate:
                         yield audio_bytes, sample_rate_val
                     else:
                         yield audio_bytes
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
+            # Emit audio_underrun_s + audio_continuity_ok_total once the audio
+            # chunk stream is exhausted cleanly (mirrors the chat path's
+            # post-loop finalize). Skipped on cancel/error branches below.
+            if (
+                mod_metrics is not None
+                and req_state is not None
+                and req_state.audio_chunk_arrivals_s
+                and req_state.audio_emit_replica_id is not None
+            ):
+                observe_audio_streaming_finalize(
+                    mod_metrics,
+                    stage_id=req_state.audio_emit_stage_id or 0,
+                    replica_id=req_state.audio_emit_replica_id,
+                    chunk_arrival_times_s=req_state.audio_chunk_arrivals_s,
+                    chunk_bytes=req_state.audio_chunk_bytes,
+                    sample_rate=(req_state.audio_sample_rate or _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE),
+                )
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             if first_audio_chunk_s is not None:
                 first_chunk_ms = (first_audio_chunk_s - stream_start_s) * 1000.0
