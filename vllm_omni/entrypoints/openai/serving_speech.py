@@ -59,6 +59,7 @@ from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics import definitions as _metric_defs
 from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
+    observe_audio_nonstreaming_finalize,
     observe_audio_streaming_finalize,
 )
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
@@ -2856,9 +2857,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         yield audio_bytes
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
-            # Emit audio_underrun_s + audio_continuity_ok_total once the audio
-            # chunk stream is exhausted cleanly (mirrors the chat path's
-            # post-loop finalize). Skipped on cancel/error branches below.
+            # Emit the per-request audio families once the chunk stream is
+            # exhausted cleanly: audio_underrun_s + audio_continuity_ok_total,
+            # plus audio_frames / audio_duration_s / audio_rtf computed from the
+            # accumulated PCM bytes. The engine finalize hook cannot emit
+            # frames/duration/rtf for streaming TTS (audio is drained per step
+            # before finalize), so this entrypoint is the reliable source.
+            # Skipped on cancel/error branches below.
             if (
                 mod_metrics is not None
                 and req_state is not None
@@ -2872,6 +2877,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     chunk_arrival_times_s=req_state.audio_chunk_arrivals_s,
                     chunk_bytes=req_state.audio_chunk_bytes,
                     sample_rate=(req_state.audio_sample_rate or _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE),
+                    gen_time_s=max(time.perf_counter() - stream_start_s, 0.0),
                 )
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             if first_audio_chunk_s is not None:
@@ -3823,6 +3829,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # computed SpeechTokenUsage is appended to it. The return stays a
         # 2-tuple so existing callers (and their test mocks) are unaffected;
         # only the batch path, which surfaces per-item usage, opts in.
+        gen_start_s = time.perf_counter()
         request_id, generator, bytes_tts_params = await self._prepare_speech_generation(request, request_id=request_id)
         artifact_ready = False
 
@@ -3925,6 +3932,48 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_response: AudioResponse = self.create_audio(audio_obj)
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
+            # Account audio_frames / audio_duration_s / audio_rtf for the
+            # non-streaming path. We hold the full waveform here, so frames =
+            # samples on the last axis; the engine finalize hook can't emit
+            # these (audio is drained before finalize). (stage, replica) is
+            # resolved like the streaming path; underrun/continuity are
+            # streaming-only and intentionally absent.
+            mod_metrics = getattr(self.engine_client, "mod_metrics", None)
+            if mod_metrics is not None and final_output is not None:
+                n_frames = int(audio_tensor.shape[-1]) if getattr(audio_tensor, "ndim", 0) else 0
+                if n_frames > 0:
+                    req_state = next(
+                        (s for s in self.engine_client.request_states.values() if s.external_request_id == request_id),
+                        None,
+                    )
+                    emit_stage_id = final_output.stage_id
+                    stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
+                    replica_id = (
+                        stage_pools[emit_stage_id].get_bound_replica_id(req_state.request_id)
+                        if (
+                            req_state is not None
+                            and stage_pools is not None
+                            and emit_stage_id is not None
+                            and 0 <= emit_stage_id < len(stage_pools)
+                        )
+                        else None
+                    )
+                    # Non-streaming is FINAL_ONLY, so the route binding may have
+                    # been released by the orchestrator finalize before we get
+                    # here (unlike the streaming path, which resolves at the
+                    # first packet while still bound). Fall back to replica 0 so
+                    # single-replica deployments — the common case — still record;
+                    # multi-replica gets a best-effort label on this edge.
+                    if replica_id is None:
+                        replica_id = 0
+                    observe_audio_nonstreaming_finalize(
+                        mod_metrics,
+                        stage_id=emit_stage_id if emit_stage_id is not None else 0,
+                        replica_id=replica_id,
+                        n_frames=n_frames,
+                        sample_rate=int(sample_rate),
+                        gen_time_s=max(time.perf_counter() - gen_start_s, 0.0),
+                    )
             if usage_out is not None:
                 usage_out.append(self._build_speech_usage(request, bytes_tts_params or {}, usage_acc.total()))
             return audio_response.audio_data, audio_response.media_type

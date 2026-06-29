@@ -232,16 +232,17 @@ def observe_modality_at_finalize(
             replica_label,
             defs.compute_audio_rtf(gen_time_s, duration_s),
         )
-    else:
-        # Request completed (finish_reason ∈ {stop, length} — error paths
-        # don't reach finalize) but no audio samples were produced. Covers
-        # silent `return None` skips in the talker→code2wav stage
-        # processors and the `parsed.append((0,0))` malformed-length path
-        # in qwen3-tts code2wav. raise-paths surface via the upstream
-        # vllm:request_success_total{finished_reason="error"} channel and
-        # never reach this branch.
-        mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
-    # audio_underrun / continuity are emitted from the streaming path in
+    # NOTE: we intentionally do NOT emit audio_skipped here on n_frames == 0.
+    # For the streaming audio pipeline the per-step audio tensors are drained
+    # before finalize (see output_processor `DRAINABLE_MODALITIES`), so
+    # `engine_outputs` carries no audio and `stage_metrics.audio_generated_frames`
+    # is 0 — i.e. 0-frames-at-finalize is the NORMAL case, not a true silent
+    # loss. Firing audio_skipped here produced a false positive on every healthy
+    # request. Audio frames/duration/rtf are accounted from the streaming
+    # entrypoint instead (observe_audio_streaming_finalize), which sees every
+    # emitted chunk. When `audio_generated_frames` IS populated (non-drain
+    # paths), the duration/rtf above still fire.
+    # audio_underrun / continuity are also emitted from the streaming path in
     # observe_audio_streaming_finalize; finalize is too late for the
     # per-chunk timeline they need.
 
@@ -276,14 +277,23 @@ def observe_audio_streaming_finalize(
     chunk_arrival_times_s: list[float],
     chunk_bytes: list[int],
     sample_rate: int,
+    gen_time_s: float = 0.0,
     threshold_s: float = defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S,
 ) -> None:
-    """Emit audio_underrun_s + audio_continuity_ok_total at request end.
+    """Emit the per-request audio families at streaming request end:
+    audio_underrun_s + audio_continuity_ok_total, plus audio_frames /
+    audio_duration_s / audio_rtf computed from the accumulated PCM bytes.
 
-    Reuses the math from ``vllm_omni.benchmarks.audio_continuity`` so the
-    server-side and bench-side definitions stay aligned. Caller is responsible
-    for collecting per-chunk arrival timestamps and byte sizes during the
-    streaming response.
+    Why frames/duration/rtf are accounted HERE rather than in the engine-side
+    ``observe_modality_at_finalize`` hook: the streaming audio pipeline drains
+    each step's audio tensor before e2e finalize, so the finalize hook sees 0
+    frames. The streaming entrypoint is the one place that observes every
+    emitted chunk, so the byte total here is the reliable frame source.
+
+    Reuses the continuity math from ``vllm_omni.benchmarks.audio_continuity`` so
+    the server-side and bench-side definitions stay aligned. Caller collects
+    per-chunk arrival timestamps and byte sizes during the streaming response
+    and passes ``gen_time_s`` (wall-clock generation time) for the RTF.
     """
     if replica_id is None or not chunk_arrival_times_s:
         return
@@ -301,3 +311,67 @@ def observe_audio_streaming_finalize(
     mod_metrics.observe_audio_underrun(stage_label, replica_label, stats.max_underrun_s)
     if stats.is_continuous:
         mod_metrics.inc_audio_continuity_ok(stage_label, replica_label, int(threshold_s * 1000))
+
+    # frames / duration / rtf from accumulated PCM bytes. PCM is s16le mono
+    # (2 bytes/frame), matching compute_continuity_stats' sample_width=2 /
+    # single-channel assumption above.
+    _observe_audio_volume(
+        mod_metrics,
+        stage_label,
+        replica_label,
+        n_frames=sum(chunk_bytes) // 2,
+        sample_rate=sample_rate,
+        gen_time_s=gen_time_s,
+    )
+
+
+def _observe_audio_volume(
+    mod_metrics: OmniModalityMetrics,
+    stage_label: str,
+    replica_label: str,
+    *,
+    n_frames: int,
+    sample_rate: int,
+    gen_time_s: float,
+) -> None:
+    """Emit audio_frames + audio_duration_s (+ audio_rtf when gen_time known).
+
+    Shared by the streaming and non-streaming speech finalize paths, which both
+    count frames from the audio they observe directly (the engine finalize hook
+    can't — audio is drained before e2e finalize).
+    """
+    if n_frames <= 0 or sample_rate <= 0:
+        return
+    mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
+    duration_s = n_frames / sample_rate
+    mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
+    if gen_time_s > 0:
+        mod_metrics.observe_audio_rtf(stage_label, replica_label, defs.compute_audio_rtf(gen_time_s, duration_s))
+
+
+def observe_audio_nonstreaming_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int | None,
+    n_frames: int,
+    sample_rate: int,
+    gen_time_s: float = 0.0,
+) -> None:
+    """Emit audio_frames / audio_duration_s / audio_rtf for a non-streaming
+    speech request.
+
+    The non-streaming entrypoint assembles the full waveform, so it can count
+    frames directly. There is no underrun / continuity here — those need the
+    per-chunk arrival timeline that only the streaming path has.
+    """
+    if replica_id is None:
+        return
+    _observe_audio_volume(
+        mod_metrics,
+        str(stage_id),
+        str(replica_id),
+        n_frames=n_frames,
+        sample_rate=sample_rate,
+        gen_time_s=gen_time_s,
+    )
