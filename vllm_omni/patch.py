@@ -415,3 +415,70 @@ def _patch_fp8_use_quack_fused_bias():
 
 
 _patch_fp8_use_quack_fused_bias()
+
+
+# =============================================================================
+# Preserve vllm_omni:* Prometheus families across vLLM's registry wipe
+# =============================================================================
+# WHY: vLLM's `unregister_vllm_metrics()` (vllm/v1/metrics/prometheus.py)
+# strips every collector whose name merely *contains* "vllm":
+#
+#     for collector in list(registry._collector_to_names):
+#         if hasattr(collector, "_name") and "vllm" in collector._name:
+#             registry.unregister(collector)
+#
+# `PrometheusStatLogger.__init__` calls it before re-registering the upstream
+# `vllm:*` families. Our omni families are named `vllm_omni:...` and are
+# registered at import time (omni_base -> metrics.modality / metrics.prometheus),
+# i.e. BEFORE the orchestrator builds OmniPrometheusStatLogger. The substring
+# match therefore unregisters every `vllm_omni:*` family, and nothing
+# re-registers them — so the entire `vllm_omni:*` namespace vanishes from
+# `/metrics`. This only triggers WITH `--log-stats` (which is what builds the
+# stat logger), so a TTS server launched with `--log-stats` shows the `vllm:*`
+# families but zero `vllm_omni:*` ones. Confirmed on a clean A100 run:
+# correct branch + `--log-stats`, namespace absent.
+#
+# FIX: replace `unregister_vllm_metrics` with a scoped version that strips only
+# true upstream `vllm:*` collectors and preserves omni-owned ones
+# (`vllm_omni:` / `vllm:omni_`). Patched on BOTH the defining module and the
+# loggers module namespace, because PrometheusStatLogger.__init__ resolves the
+# bare name from its own module globals (`from ... import unregister_vllm_metrics`).
+#
+# SCOPE: omni families are module-level singletons created once at import and
+# never re-registered, so preserving them across the wipe cannot cause
+# duplicate-registration errors; the upstream `vllm:*` families are still fully
+# cleared and re-registered as before.
+#
+# FRAGILITY: relies on the upstream function name plus the `_name` /
+# `_collector_to_names` prometheus_client internals. Revisit on vLLM bumps.
+def _patch_unregister_vllm_metrics_preserve_omni():
+    try:
+        from vllm.v1.metrics import loggers as _loggers
+        from vllm.v1.metrics import prometheus as _prom
+    except Exception:  # noqa: BLE001
+        return
+
+    if getattr(_prom.unregister_vllm_metrics, "_omni_preserve_patched", False):
+        return
+
+    def _scoped_unregister_vllm_metrics():
+        from prometheus_client import REGISTRY
+
+        for collector in list(REGISTRY._collector_to_names):
+            name = getattr(collector, "_name", "")
+            if "vllm" not in name:
+                continue
+            # Preserve omni-owned families; strip only upstream `vllm:*` ones.
+            if name.startswith("vllm_omni") or name.startswith("vllm:omni"):
+                continue
+            REGISTRY.unregister(collector)
+
+    _scoped_unregister_vllm_metrics._omni_preserve_patched = True
+
+    _prom.unregister_vllm_metrics = _scoped_unregister_vllm_metrics
+    if hasattr(_loggers, "unregister_vllm_metrics"):
+        _loggers.unregister_vllm_metrics = _scoped_unregister_vllm_metrics
+    _PATCH_LOGGER.info("Scoped unregister_vllm_metrics installed (preserves vllm_omni:* families).")
+
+
+_patch_unregister_vllm_metrics_preserve_omni()
