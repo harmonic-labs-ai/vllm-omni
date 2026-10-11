@@ -34,6 +34,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "Qwen3VLMoeVisionConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
+    "MisoTTSConfig": "vllm_omni.transformers_utils.configs.miso_tts",
     "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
     "SenseNovaU1MoELLMConfig": "vllm_omni.transformers_utils.configs.sensenova_u1",
@@ -65,6 +66,7 @@ __all__ = [
     "MingFlashOmniConfig",
     "Qwen3VLMoeVisionConfig",
     "WhisperEncoderConfig",
+    "MisoTTSConfig",
     "SenseNovaU1Config",
     "SenseNovaU1MoELLMConfig",
 ]
@@ -94,6 +96,7 @@ from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import miso_tts as _miso_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
